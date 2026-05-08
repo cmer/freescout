@@ -1,0 +1,185 @@
+diff --git a/app/Console/Commands/LogsMonitor.php b/app/Console/Commands/LogsMonitor.php
+index 67504287..186b42b8 100644
+--- a/app/Console/Commands/LogsMonitor.php
++++ b/app/Console/Commands/LogsMonitor.php
+@@ -20,6 +20,34 @@ class LogsMonitor extends Command
+      */
+     protected $description = 'Send new log records by email';
+ 
++    /**
++     * Default minimum identical-error occurrences required for
++     * `fetch_errors` entries to be included in the digest. Used when
++     * the `alert_logs_fetch_min_occurrences` option is not set. The
++     * default is 1, which matches upstream behaviour (no filtering);
++     * raise it via the alerts settings page to suppress transient
++     * single-shot fetch errors.
++     */
++    const FETCH_ERRORS_MIN_OCCURRENCES_DEFAULT = 1;
++
++    /**
++     * Substrings that mark a `fetch_errors` row as transient. Rows
++     * matching any of these are dropped regardless of count, unless
++     * they appear at least the configured min-occurrences times.
++     */
++    const FETCH_ERRORS_TRANSIENT_PATTERNS = [
++        'connection setup failed',
++        'failed to fetch messages',
++        'failed to authenticate',
++        'Connection closed',
++        'Connection reset',
++        'Connection timed out',
++        'Connection refused',
++        'stream_socket_client',
++        'SSL operation failed',
++        'Temporary failure',
++    ];
++
+     /**
+      * Create a new command instance.
+      *
+@@ -62,6 +90,8 @@ class LogsMonitor extends Command
+             ->where('created_at', '<', $now->toDateTimeString())
+             ->get();
+ 
++        $logs = $this->filterTransientFetchErrors($logs);
++
+         if (!count($logs)) {
+             $this->line('['.date('Y-m-d H:i:s').'] No new log records found for the last '.$options['alert_logs_period']);
+ 
+@@ -93,4 +123,88 @@ class LogsMonitor extends Command
+ 
+         $this->info('['.date('Y-m-d H:i:s').'] Monitoring finished');
+     }
++
++    /**
++     * Drop transient single-shot fetch errors. A fetch_errors row is
++     * considered transient when its error message matches one of the
++     * known transient patterns AND the same message appears fewer
++     * than the configured min-occurrences threshold within the window.
++     */
++    protected function filterTransientFetchErrors($logs)
++    {
++        $threshold = (int) \Option::get(
++            'alert_logs_fetch_min_occurrences',
++            self::FETCH_ERRORS_MIN_OCCURRENCES_DEFAULT
++        );
++
++        if ($threshold <= 1) {
++            return $logs;
++        }
++
++        $fetchLogName = \App\ActivityLog::NAME_EMAILS_FETCHING;
++
++        $counts = [];
++        foreach ($logs as $log) {
++            if ($log->log_name !== $fetchLogName) {
++                continue;
++            }
++            $key = $this->fetchErrorFingerprint($log);
++            $counts[$key] = ($counts[$key] ?? 0) + 1;
++        }
++
++        $dropped = 0;
++        $filtered = $logs->reject(function ($log) use ($fetchLogName, $counts, $threshold, &$dropped) {
++            if ($log->log_name !== $fetchLogName) {
++                return false;
++            }
++            $message = $this->fetchErrorMessage($log);
++            if (!$this->isTransientFetchError($message)) {
++                return false;
++            }
++            $key = $this->fetchErrorFingerprint($log);
++            if (($counts[$key] ?? 0) >= $threshold) {
++                return false;
++            }
++            $dropped++;
++            return true;
++        });
++
++        if ($dropped > 0) {
++            $this->line('['.date('Y-m-d H:i:s').'] Suppressed '.$dropped.' transient fetch_errors entries (threshold '.$threshold.')');
++        }
++
++        return $filtered->values();
++    }
++
++    protected function fetchErrorMessage($log): string
++    {
++        $props = $log->properties;
++        if (is_object($props) && method_exists($props, 'toArray')) {
++            $props = $props->toArray();
++        } elseif (is_string($props)) {
++            $decoded = json_decode($props, true);
++            $props = is_array($decoded) ? $decoded : [];
++        }
++        return (string) ($props['error'] ?? '');
++    }
++
++    protected function fetchErrorFingerprint($log): string
++    {
++        $message = $this->fetchErrorMessage($log);
++        // Strip the trailing "; File: /path (line)" so the same error
++        // from different stack frames still groups together.
++        $message = preg_replace('/;\s*File:.*$/s', '', $message);
++        return trim($message);
++    }
++
++    protected function isTransientFetchError(string $message): bool
++    {
++        $lower = strtolower($message);
++        foreach (self::FETCH_ERRORS_TRANSIENT_PATTERNS as $needle) {
++            if (strpos($lower, strtolower($needle)) !== false) {
++                return true;
++            }
++        }
++        return false;
++    }
+ }
+diff --git a/app/Http/Controllers/SettingsController.php b/app/Http/Controllers/SettingsController.php
+index 75998dc3..aacb4cbc 100644
+--- a/app/Http/Controllers/SettingsController.php
++++ b/app/Http/Controllers/SettingsController.php
+@@ -233,11 +233,13 @@ class SettingsController extends Controller
+                     'alert_logs',
+                     'alert_logs_names',
+                     'alert_logs_period',
++                    'alert_logs_fetch_min_occurrences',
+                     'subscription_defaults',
+                 ], [
+-                    'alert_logs_names'  => [],
+-                    'alert_logs'        => config('app.alert_logs'),
+-                    'alert_logs_period' => config('app.alert_logs_period'),
++                    'alert_logs_names'                 => [],
++                    'alert_logs'                       => config('app.alert_logs'),
++                    'alert_logs_period'                => config('app.alert_logs_period'),
++                    'alert_logs_fetch_min_occurrences' => \App\Console\Commands\LogsMonitor::FETCH_ERRORS_MIN_OCCURRENCES_DEFAULT,
+                 ]);
+                 break;
+             default:
+diff --git a/resources/views/settings/alerts.blade.php b/resources/views/settings/alerts.blade.php
+index 4be752fe..f585b576 100644
+--- a/resources/views/settings/alerts.blade.php
++++ b/resources/views/settings/alerts.blade.php
+@@ -54,7 +54,7 @@
+                     </div>
+                 @endforeach
+                 <div class="control-group form-inline margin-top-10">
+-                    <label for="alert_logs_period" class="control-label">{{ __('Check Frequency') }}</label> 
++                    <label for="alert_logs_period" class="control-label">{{ __('Check Frequency') }}</label>
+                     <select name="settings[alert_logs_period]" class="form-control">
+                         <option value="hour" @if (old('settings[alert_logs_period]', $settings['alert_logs_period']) == 'hour') selected @endif>{{ __('Hourly') }}</option>
+                         <option value="day" @if (old('settings[alert_logs_period]', $settings['alert_logs_period']) == 'day') selected @endif>{{ __('Daily') }}</option>
+@@ -62,6 +62,13 @@
+                         <option value="month" @if (old('settings[alert_logs_period]', $settings['alert_logs_period']) == 'month') selected @endif>{{ __('Monthly') }}</option>
+                     </select>
+                 </div>
++                <div class="control-group form-inline margin-top-10">
++                    <label for="alert_logs_fetch_min_occurrences" class="control-label">{{ __('Fetch Errors Threshold') }}</label>
++                    <input id="alert_logs_fetch_min_occurrences" type="number" min="1" class="form-control" name="settings[alert_logs_fetch_min_occurrences]" value="{{ old('settings[alert_logs_fetch_min_occurrences]', $settings['alert_logs_fetch_min_occurrences']) }}">
++                    <p class="help-block">
++                        {{ __('Suppress transient fetch errors (e.g. brief IMAP connection drops) unless the same error occurs at least this many times within the check frequency window. Set to 1 to disable filtering.') }}
++                    </p>
++                </div>
+             </div>
+         </div>
+     </div>
