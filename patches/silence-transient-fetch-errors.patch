@@ -1,5 +1,5 @@
 diff --git a/app/Console/Commands/LogsMonitor.php b/app/Console/Commands/LogsMonitor.php
-index 67504287..186b42b8 100644
+index 67504287..bc29e8b0 100644
 --- a/app/Console/Commands/LogsMonitor.php
 +++ b/app/Console/Commands/LogsMonitor.php
 @@ -20,6 +20,34 @@ class LogsMonitor extends Command
@@ -46,7 +46,7 @@ index 67504287..186b42b8 100644
          if (!count($logs)) {
              $this->line('['.date('Y-m-d H:i:s').'] No new log records found for the last '.$options['alert_logs_period']);
  
-@@ -93,4 +123,88 @@ class LogsMonitor extends Command
+@@ -93,4 +123,87 @@ class LogsMonitor extends Command
  
          $this->info('['.date('Y-m-d H:i:s').'] Monitoring finished');
      }
@@ -79,28 +79,27 @@ index 67504287..186b42b8 100644
 +            $counts[$key] = ($counts[$key] ?? 0) + 1;
 +        }
 +
++        $kept = [];
 +        $dropped = 0;
-+        $filtered = $logs->reject(function ($log) use ($fetchLogName, $counts, $threshold, &$dropped) {
-+            if ($log->log_name !== $fetchLogName) {
-+                return false;
++        foreach ($logs as $log) {
++            if ($log->log_name === $fetchLogName) {
++                $message = $this->fetchErrorMessage($log);
++                if ($this->isTransientFetchError($message)) {
++                    $key = $this->fetchErrorFingerprint($log);
++                    if (($counts[$key] ?? 0) < $threshold) {
++                        $dropped++;
++                        continue;
++                    }
++                }
 +            }
-+            $message = $this->fetchErrorMessage($log);
-+            if (!$this->isTransientFetchError($message)) {
-+                return false;
-+            }
-+            $key = $this->fetchErrorFingerprint($log);
-+            if (($counts[$key] ?? 0) >= $threshold) {
-+                return false;
-+            }
-+            $dropped++;
-+            return true;
-+        });
++            $kept[] = $log;
++        }
 +
 +        if ($dropped > 0) {
 +            $this->line('['.date('Y-m-d H:i:s').'] Suppressed '.$dropped.' transient fetch_errors entries (threshold '.$threshold.')');
 +        }
 +
-+        return $filtered->values();
++        return collect($kept);
 +    }
 +
 +    protected function fetchErrorMessage($log): string
